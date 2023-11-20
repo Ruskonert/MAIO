@@ -24,9 +24,11 @@ MAIO_MSG_INIT = 0
 MAIO_MSG_RECORD_TOP = 1
 MAIO_MSG_RECORD_PROCESS = 2
 MAIO_MSG_RECORD_SAR = 3
+
 MAIO_MSG_SEND_TOP = 4
 MAIO_MSG_SEND_PROCESS = 5
 MAIO_MSG_SEND_SAR = 6
+
 MAIO_MSG_TERMINATED = 7
 
 class MAIOMessage:
@@ -61,6 +63,22 @@ class MAIOMessage:
             _f.close()
         return MAIOMessage(MAIO_MSG_INIT, peer, data)
 
+    @staticmethod
+    def _maio_build_msg_record_top(filepath):
+        data = {}
+        elements = open(filepath, 'r').read().split("\n")
+        for element in elements:
+            _split_data = element.split(" ")
+            if len(_split_data) == 0:
+                continue
+
+            if len(_split_data) > 1:
+                data[_split_data[0]] = _split_data[1:]
+            else:
+                data[_split_data[0]] = []
+    
+        return MAIOMessage(MAIO_MSG_SEND_TOP, None, data)
+    
     
     @staticmethod
     def _maio_msg_record_top(handler, peer, data):
@@ -95,7 +113,7 @@ class MAIOMessage:
             except ValueError:
                 # it is not specific pid, others.
                 continue
-
+        
         for pid in result.keys():
             tids = result.get(pid, None)
             if tids == None:
@@ -106,22 +124,41 @@ class MAIOMessage:
                 if tid in result.keys():
                     del result[tid]
                     del result_cmdline[tid]
-
+        
         maio_data = {}
 
         # key is process name & value is list of command line
-        for process_name, command_line in data.items():
-            for pids, cmds in result_cmdline.items():
-                if process_name == cmds[0]:
-                    if command_line == cmds[1:]:
-                        maio_data[pids] = {
-                            "TIDS": result[pids],
-                            "CMDS": cmds
-                        }
-                        continue
-            LOG.warning(f"No found match the process with arguments, process_name={process_name}, args={command_line}")
+        for match_process_name, match_command_line in data.items():
+            equals = False
+            for pids in result_cmdline.keys():
+                cmds = result_cmdline[pids]
 
-        return MAIOMessage(MAIO_MSG_RECORD_TOP, peer, maio_data)
+                # it is system proc, not normal process.
+                if len(cmds) == 0:
+                    continue
+
+                if match_process_name == cmds[0]:
+                    if len(cmds) > 1:
+                        left = ''.join(match_command_line).lower()
+                        right = ''.join(cmds[1:]).lower()
+                        if left == right:
+                            equals = True
+                            break
+                    else:
+                        equals = True
+                        break
+
+            if equals:
+                maio_data[pids] = {
+                    "TIDS": result[pids],
+                    "CMDS": cmds
+                }
+                break
+            else:
+                LOG.warning(f"No found match the process with arguments, process_name={match_process_name}, args={match_command_line}")
+        if len(maio_data) > 0:
+            LOG.debug(f"Dissected process PID/TID & arguments -> {maio_data}")
+        return MAIOMessage(MAIO_MSG_SEND_TOP, peer, maio_data)
     
 
     @staticmethod
@@ -138,6 +175,7 @@ class MAIOMessage:
 
     @staticmethod
     def decode(handler, peer, bytes):
+        LOG.debug(f"recv by remote peer, bytes={bytes}")
         _monitor_vaildate = {
             MAIO_MSG_RECORD_TOP: None,
             MAIO_MSG_RECORD_PROCESS: None,
@@ -150,10 +188,10 @@ class MAIOMessage:
 
         _sensor_vaildate = {
             MAIO_MSG_INIT: MAIOMessage._maio_msg_init,
-            MAIO_MSG_RECORD_TOP: MAIOMessage._maio_msg_record_top,
-            MAIO_MSG_RECORD_PROCESS: MAIOMessage._maio_msg_record_top,
-            MAIO_MSG_RECORD_SAR: MAIOMessage._maio_msg_record_sar,
-            MAIO_MSG_SEND_TOP: None,
+            MAIO_MSG_RECORD_TOP: None,
+            MAIO_MSG_RECORD_PROCESS: None,
+            MAIO_MSG_RECORD_SAR: None,
+            MAIO_MSG_SEND_TOP: MAIOMessage._maio_msg_record_top,
             MAIO_MSG_SEND_PROCESS: None,
             MAIO_MSG_SEND_SAR: None,
             MAIO_MSG_TERMINATED: MAIOMessage._maio_msg_terminated,
@@ -250,6 +288,9 @@ def maio_intl_msg_dissect(handler, peer, bytes):
 def maio_intl_delegate_th(handler : MAIORemoteHandler, socket : socket.socket):
     LOG.debug(f"Created new thread for delegate data, tid={threading.get_ident()}, from={socket.getpeername()}")
 
+    msg = MAIOMessage._maio_build_msg_record_top("process_list.txt")
+    socket.send(msg.to_string().encode())
+
     try:
         while True:
             if handler._terminated:
@@ -276,12 +317,7 @@ def maio_intl_run_monitor(handler : MAIORemoteHandler):
             try:
                 with scp.SCPClient(handler._with_ssh.get_transport()) as scp:
                     scp.put(sys.argv[0], "/tmp/maio_sensor.py", preserve_times=True)
-
-                _, _, ssh_stderr = handler._with_ssh.exec_command(f'/tmp/maio_sensor.py -s 1 -i {handler._self_addr} &')
-                err = ssh_stderr.read().decode()
-                if len(err) > 0:
-                    LOG.warning(f"The remote sensor was returned error message, maybe it needs to manually execute, {err}")
-            
+                handler._with_ssh.exec_command(f'cd /tmp && python3 /tmp/maio_sensor.py -s 1 -i {handler._self_addr}')           
             except scp.SCPException as e:
                 LOG.error(f"File upload using SCP failed, reason={e}")
         except ImportError:
@@ -310,7 +346,12 @@ def maio_intl_run_sensor(handler : MAIORemoteHandler):
         while True:
             if handler._terminated:
                 break
+            
             data = handler._sock.recv(65535)
+            if len(data) == 0:
+                LOG.warning(f"monitor was disconnected, target={handler._sock.getpeername()}")
+                break
+
             if not maio_intl_msg_dissect(handler, None, data):
                 handler.try_terminate()
 
@@ -392,11 +433,13 @@ def main_wtih_arguments(args, system_type : int):
         while True:
             if maio_proc_handler._terminated:
                 break
-            rslt : MAIOMessage = maio_proc_handler.poll()
+            rslt = maio_proc_handler.poll()
             if rslt == None:
                 time.sleep(0.01)
             else:
-                # TODO
+                if rslt.type == MAIO_MSG_SEND_TOP:
+                    LOG.info(f"successfully!! {rslt}")
+                    
                 continue
     else:
         LOG.error("MAIO Program handler was failed to execute job, terminated!")
@@ -413,7 +456,10 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--ip', metavar='IP:[port]', help="Remote or client IP (e.x., 192.168.2.4, 192. 168.4.110:2004, ...)")
     parser.add_argument('--log-level', help="Set logging level", default="DEBUG")
     parser.add_argument("-s", "--system-type", help="Set sensor mode (0=monitor, 1=sensor)", default="0")
-    args = parser.parse_args()
+    args, another_args = parser.parse_known_args()
+    
+    if len(another_args) > 0:
+        args.listpath = another_args[0]
 
     log_level = logging._nameToLevel.get(args.log_level, logging.INFO)
     LOG = maio_handle_logger("./maio.log", log_level)
