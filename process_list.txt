@@ -1,1 +1,0 @@
-python3 /tmp/maio_sensor.py -s 1 -i localhost
