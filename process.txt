@@ -1,0 +1,4 @@
+STEM_DP_DAS 7
+/home/stem/bin/sdc -s
+/home/stem/bin/sm start
+/home/stem/bin/em start
